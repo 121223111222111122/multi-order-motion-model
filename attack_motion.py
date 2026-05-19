@@ -24,6 +24,7 @@ import os
 import json
 import glob
 import copy
+import random
 import numpy as np
 from PIL import Image
 import torch
@@ -57,7 +58,7 @@ def load_image(imfile):
     return torch.from_numpy(arr).permute(2, 0, 1).float()[None].to(DEVICE)
 
 
-def load_clip(path, n=15):
+def load_clip(path, n=15, max_side=None):
     images = sorted(
         glob.glob(os.path.join(path, "*.png")) + glob.glob(os.path.join(path, "*.jpg"))
     )
@@ -75,6 +76,9 @@ def load_clip(path, n=15):
     print(f"Loaded {len(images)} frames from {path}")
     frames = [load_image(f) for f in images]  # list of [1, 3, H, W]
     H, W = frames[0].shape[2:]
+    if max_side is not None and max(H, W) > max_side:
+        scale = max_side / max(H, W)
+        H, W = int(H * scale), int(W * scale)
     H8, W8 = int(np.round(H / 8)) * 8, int(np.round(W / 8)) * 8
     frames = [F.interpolate(f, size=(H8, W8), mode="bicubic", align_corners=True).clamp_(0, 255) for f in frames]
     return frames  # list of [1, 3, H8, W8]
@@ -119,12 +123,38 @@ def save_gif(frames_uint8, out_path, duration=0.1):
 # --------------------------------------------------------------------------------------
 # Model
 # --------------------------------------------------------------------------------------
+def data_preprocess_with_grad(image_list):
+    """Replacement for FFV1DNNV2.data_preprocess that preserves the autograd graph.
+
+    Original has @torch.no_grad() and uses copy.deepcopy, both of which sever the
+    gradient path from model input back to delta. This version is mathematically
+    identical (same 0-1 scaling, RGB->grayscale conversion) but pure-functional and
+    autograd-friendly."""
+    if image_list[0].max() > 10:
+        image_list = [img / 255.0 for img in image_list]
+    if image_list[0].shape[1] == 1:
+        image_list_rgb = [img.repeat(1, 3, 1, 1) for img in image_list]
+    else:
+        image_list_rgb = list(image_list)  # new list, same tensor refs (keeps grad)
+    if image_list[0].shape[1] == 3:
+        image_list = [
+            img[:, 0, :, :] * 0.299 + img[:, 1, :, :] * 0.587 + img[:, 2, :, :] * 0.114
+            for img in image_list
+        ]
+        image_list = [img.unsqueeze(1) for img in image_list]
+    return image_list, image_list_rgb
+
+
 def build_model(ckpt_path):
     model = FFV1DNNV2(num_scales=8, upsample_factor=8, scale_factor=16, num_layers=6)
     model = nn.DataParallel(model)
     state = torch.load(ckpt_path, map_location="cpu")
     model.load_state_dict(state, strict=True)
     model = model.module.cuda().eval()
+    # Override the no-grad preprocess so adversarial gradient can flow to delta.
+    # Instance-level attribute shadows the class method; since the original method
+    # doesn't actually use `self`, no rebinding needed.
+    model.data_preprocess = data_preprocess_with_grad
     return model
 
 
@@ -156,48 +186,117 @@ def extract_mask(model, frames, iters, image_uint8, tau=0.15, use_crf=True):
 # --------------------------------------------------------------------------------------
 # PGD attack
 # --------------------------------------------------------------------------------------
-def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters):
-    """frames: list of [1,3,H,W] 0-255 tensors (clean). mask_t: [1,1,H,W] in {0,1}.
-    Returns (perturbed_frames_list, delta_tensor). delta has shape [T, 3, H, W]."""
+def apply_eot_aug(perturbed, jitter_px=2, brightness_jitter=0.03, noise_std=0.5):
+    """Small input augmentation for EOT. perturbed: [T, 3, H, W] in 0-255 space.
+
+    - Random integer translation by up to +/- jitter_px (same shift for all frames,
+      preserves the underlying motion structure).
+    - Multiplicative brightness in (1 +/- brightness_jitter).
+    - Additive Gaussian noise with std noise_std (in pixel units).
+
+    All small enough that motion content is preserved; large enough that pixel-level
+    overfitting in delta gets penalized."""
+    dx = random.randint(-jitter_px, jitter_px)
+    dy = random.randint(-jitter_px, jitter_px)
+    b = 1.0 + random.uniform(-brightness_jitter, brightness_jitter)
+    aug = perturbed * b
+    if noise_std > 0:
+        aug = aug + torch.randn_like(aug) * noise_std
+    if dx != 0 or dy != 0:
+        aug = torch.roll(aug, shifts=(dy, dx), dims=(-2, -1))
+    return aug.clamp(0.0, 255.0)
+
+
+def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
+               smooth_factor=1, n_eot=1,
+               clean_flow=None, clean_flow_1=None, objective="zero"):
+    """PGD with bandwidth limiting (smooth_factor), EOT, and configurable objective.
+
+    Bandwidth limiting: delta is parameterized at H/k x W/k and bilinearly upsampled
+    so the perturbation lives at a spatial scale humans process.
+
+    EOT: at each PGD step, average the gradient over `n_eot` random augmentations
+    (translation/brightness/noise) of the perturbed input. Prevents the optimizer
+    from finding brittle pixel-level patterns that only fool this model.
+
+    Objective:
+        "zero"    - minimize ||flow * mask||^2          (model sees no motion)
+        "counter" - minimize ||(flow + clean_flow) * mask||^2
+                    (push model toward seeing motion in the OPPOSITE direction;
+                    encourages the perturbation to itself carry counter-motion
+                    energy, which is what humans would perceive)."""
     T = len(frames)
     _, _, H, W = frames[0].shape
-    frames_stack = torch.cat(frames, dim=0)  # [T, 3, H, W]
+    frames_stack = torch.cat(frames, dim=0)
 
-    # random init within [-eps, +eps], then ensure x+delta stays in [0, 255]
-    delta = torch.empty_like(frames_stack).uniform_(-eps, eps).to(DEVICE)
-    delta = torch.clamp(frames_stack + delta, 0.0, 255.0) - frames_stack
-    delta.requires_grad_(True)
+    if objective == "counter":
+        assert clean_flow is not None and clean_flow_1 is not None, \
+            "counter objective requires the clean flow as target"
+        target_flow = clean_flow.detach()
+        target_flow_1 = clean_flow_1.detach()
+
+    Hs = max(1, H // smooth_factor)
+    Ws = max(1, W // smooth_factor)
+    print(f"[attack] delta parameterized at {Hs}x{Ws}, upsampled {smooth_factor}x to {H}x{W}")
+    print(f"[attack] objective={objective}  n_eot={n_eot}")
+
+    delta_lr = torch.empty(T, 3, Hs, Ws, device=DEVICE).uniform_(-eps, eps)
+    delta_lr.requires_grad_(True)
+
+    def upsample(d):
+        if smooth_factor == 1:
+            return d
+        return F.interpolate(d, size=(H, W), mode="bilinear", align_corners=True)
+
+    def compute_loss(out):
+        flow = out["flow_seq"][-1]
+        flow_1 = out["flow_seq_1"][-1]
+        if objective == "zero":
+            return ((flow * mask_t) ** 2).mean() + ((flow_1 * mask_t) ** 2).mean(), flow, flow_1
+        else:  # counter
+            return (((flow + target_flow) * mask_t) ** 2).mean() + \
+                   (((flow_1 + target_flow_1) * mask_t) ** 2).mean(), flow, flow_1
 
     for step in range(steps):
-        perturbed = frames_stack + delta
-        perturbed_list = [perturbed[i : i + 1] for i in range(T)]
+        grad_accum = torch.zeros_like(delta_lr)
+        last_flow, last_flow_1, last_loss = None, None, None
 
-        out = model.forward(perturbed_list, mix_enable=False, layer=iters)
-        flow = out["flow_seq"][-1]       # [1, 2, H, W]
-        flow_1 = out["flow_seq_1"][-1]   # [1, 2, H, W]
+        for eot_i in range(n_eot):
+            delta = upsample(delta_lr)
+            perturbed = (frames_stack + delta).clamp(0.0, 255.0)
+            # First sample uses unaugmented input (so step-end metrics reflect the
+            # true loss on the actual perturbed video); subsequent samples are
+            # randomly augmented to make the gradient EOT-style.
+            if eot_i > 0:
+                perturbed = apply_eot_aug(perturbed)
+            perturbed_list = [perturbed[i : i + 1] for i in range(T)]
 
-        # masked squared flow magnitude on both pathways
-        loss = ((flow * mask_t) ** 2).mean() + ((flow_1 * mask_t) ** 2).mean()
+            out = model.forward(perturbed_list, mix_enable=False, layer=iters)
+            loss, flow, flow_1 = compute_loss(out)
+            grad = torch.autograd.grad(loss, delta_lr)[0]
+            grad_accum = grad_accum + grad
 
-        grad = torch.autograd.grad(loss, delta)[0]
+            if eot_i == 0:
+                last_flow, last_flow_1, last_loss = flow.detach(), flow_1.detach(), loss.item()
 
-        # signed-gradient descent step + project to L_inf ball + clip pixel range
+        grad = grad_accum / n_eot
+
         with torch.no_grad():
-            delta = delta - alpha * grad.sign()
-            delta = torch.clamp(delta, -eps, eps)
-            delta = torch.clamp(frames_stack + delta, 0.0, 255.0) - frames_stack
-        delta.requires_grad_(True)
+            delta_lr = delta_lr - alpha * grad.sign()
+            delta_lr = torch.clamp(delta_lr, -eps, eps)
+        delta_lr.requires_grad_(True)
 
         if step % 5 == 0 or step == steps - 1:
             with torch.no_grad():
-                flow_mag = (flow * mask_t).pow(2).mean().sqrt().item()
-                flow_1_mag = (flow_1 * mask_t).pow(2).mean().sqrt().item()
-            print(f"  step {step:3d}  loss={loss.item():.4f}  "
+                flow_mag = (last_flow * mask_t).pow(2).mean().sqrt().item()
+                flow_1_mag = (last_flow_1 * mask_t).pow(2).mean().sqrt().item()
+            print(f"  step {step:3d}  loss={last_loss:.4f}  "
                   f"masked_rms[flow]={flow_mag:.3f}  masked_rms[flow_1]={flow_1_mag:.3f}")
 
-    delta = delta.detach()
-    perturbed_list = [(frames_stack[i : i + 1] + delta[i : i + 1]).clamp(0, 255) for i in range(T)]
-    return perturbed_list, delta
+    delta_lr = delta_lr.detach()
+    delta_final = upsample(delta_lr)
+    perturbed_list = [(frames_stack[i : i + 1] + delta_final[i : i + 1]).clamp(0, 255) for i in range(T)]
+    return perturbed_list, delta_final
 
 
 # --------------------------------------------------------------------------------------
@@ -229,6 +328,14 @@ def main():
     ap.add_argument("--iters", type=int, default=8, help="model recurrent iterations; lower to save memory")
     ap.add_argument("--mask-tau", type=float, default=0.15, help="MaskCut threshold")
     ap.add_argument("--no-crf", action="store_true", help="skip DenseCRF refinement of the mask")
+    ap.add_argument("--smooth-factor", type=int, default=4,
+                    help="parameterize delta at H/k x W/k, upsample to (H,W); k=1 means per-pixel (likely won't transfer to humans), k=4-8 forces a human-visible spatial scale")
+    ap.add_argument("--max-side", type=int, default=None,
+                    help="downscale input so longer side is <= this (helps with GPU memory)")
+    ap.add_argument("--n-eot", type=int, default=3,
+                    help="EOT samples per PGD step (>=2 averages gradients over random augmentations; 1 disables EOT)")
+    ap.add_argument("--objective", choices=["zero", "counter"], default="counter",
+                    help="zero: minimize ||flow||^2 (see no motion); counter: push toward OPPOSITE of clean flow (see counter-motion). counter is more likely to produce a perturbation that engages human motion processing.")
     args = ap.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     alpha = args.alpha if args.alpha is not None else args.eps / 10.0
@@ -237,7 +344,7 @@ def main():
     print(f"[setup] pydensecrf available: {HAS_CRF}")
 
     model = build_model(args.model)
-    frames = load_clip(args.path, n=15)
+    frames = load_clip(args.path, n=15, max_side=args.max_side)
     T, _, _, H, W = (len(frames),) + tuple(frames[0].shape)
     print(f"[setup] T={T}  H={H}  W={W}")
 
@@ -260,13 +367,27 @@ def main():
     # === Clean baseline ===
     clean_metrics, clean_out = masked_flow_magnitudes(model, frames, mask_t, args.iters)
     print(f"[clean] {clean_metrics}")
+    # Keep final flow tensors from both pathways (needed for counter-motion target and visualization)
+    clean_flow_final = clean_out["flow_seq"][-1].detach().clone()
+    clean_flow_1_final = clean_out["flow_seq_1"][-1].detach().clone()
+    del clean_out
+    torch.cuda.empty_cache()
 
     # === PGD attack ===
-    print(f"[attack] running PGD ({args.steps} steps)")
+    print(f"[attack] running PGD ({args.steps} steps, smooth_factor={args.smooth_factor}, n_eot={args.n_eot}, objective={args.objective})")
     perturbed_frames, delta = pgd_attack(model, frames, mask_t,
                                          eps=args.eps, steps=args.steps,
-                                         alpha=alpha, iters=args.iters)
+                                         alpha=alpha, iters=args.iters,
+                                         smooth_factor=args.smooth_factor,
+                                         n_eot=args.n_eot,
+                                         clean_flow=clean_flow_final,
+                                         clean_flow_1=clean_flow_1_final,
+                                         objective=args.objective)
+    torch.cuda.empty_cache()
     attack_metrics, attack_out = masked_flow_magnitudes(model, perturbed_frames, mask_t, args.iters)
+    attack_flow_final = attack_out["flow_seq"][-1].detach().clone()
+    del attack_out
+    torch.cuda.empty_cache()
     print(f"[attack] {attack_metrics}")
 
     # === Matched random noise control ===
@@ -275,6 +396,9 @@ def main():
     rand_perturbed = (frames_stack + rand_delta).clamp(0, 255)
     rand_frames = [rand_perturbed[i : i + 1] for i in range(T)]
     noise_metrics, noise_out = masked_flow_magnitudes(model, rand_frames, mask_t, args.iters)
+    noise_flow_final = noise_out["flow_seq"][-1].detach().clone()
+    del noise_out
+    torch.cuda.empty_cache()
     print(f"[noise] {noise_metrics}")
 
     # === Save artifacts ===
@@ -283,6 +407,9 @@ def main():
         "eps_pct_of_255": 100 * args.eps / 255,
         "steps": args.steps,
         "alpha": alpha,
+        "smooth_factor": args.smooth_factor,
+        "n_eot": args.n_eot,
+        "objective": args.objective,
         "mask_coverage_pct": float(100 * mask_np.mean()),
         "clean": clean_metrics,
         "attack": attack_metrics,
@@ -293,21 +420,30 @@ def main():
     with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # GIFs: flow quivers for clean / attack / noise side by side per condition
-    print(f"[save] writing GIFs to {args.save_dir}")
-    save_gif([quiver_overlay(to_numpy_uint8(frames[i]), clean_out["flow_seq"][-1],
-                             title=f"CLEAN frame {i}") for i in range(T)],
-             os.path.join(args.save_dir, "clean.gif"))
-    save_gif([quiver_overlay(to_numpy_uint8(perturbed_frames[i]), attack_out["flow_seq"][-1],
-                             title=f"ATTACKED frame {i}") for i in range(T)],
-             os.path.join(args.save_dir, "attacked.gif"))
-    save_gif([quiver_overlay(to_numpy_uint8(rand_frames[i]), noise_out["flow_seq"][-1],
-                             title=f"NOISE frame {i}") for i in range(T)],
-             os.path.join(args.save_dir, "noise.gif"))
+    # Flow quivers: ONE PNG per condition (the model produces one flow per 15-frame
+    # window, so an animation would just show stationary arrows). Use the middle
+    # frame as the canvas.
+    print(f"[save] writing visualizations to {args.save_dir}")
+    mid = T // 2
+    Image.fromarray(quiver_overlay(to_numpy_uint8(frames[mid]), clean_flow_final,
+                                   title=f"CLEAN  rms={clean_metrics['rms_flow']:.3f}")).save(
+        os.path.join(args.save_dir, "clean.png"))
+    Image.fromarray(quiver_overlay(to_numpy_uint8(perturbed_frames[mid]), attack_flow_final,
+                                   title=f"ATTACKED  rms={attack_metrics['rms_flow']:.3f}")).save(
+        os.path.join(args.save_dir, "attacked.png"))
+    Image.fromarray(quiver_overlay(to_numpy_uint8(rand_frames[mid]), noise_flow_final,
+                                   title=f"NOISE  rms={noise_metrics['rms_flow']:.3f}")).save(
+        os.path.join(args.save_dir, "noise.png"))
 
-    # Perturbed video (so you can eyeball whether the perturbation is visible)
+    # Input frames as separate animations (no overlay): the question these answer
+    # is "does the moving object still visibly move?" - which can't be answered
+    # from a still arrow plot.
+    save_gif([to_numpy_uint8(f) for f in frames],
+             os.path.join(args.save_dir, "clean_video.gif"))
     save_gif([to_numpy_uint8(f) for f in perturbed_frames],
-             os.path.join(args.save_dir, "perturbed_video.gif"))
+             os.path.join(args.save_dir, "attacked_video.gif"))
+    save_gif([to_numpy_uint8(f) for f in rand_frames],
+             os.path.join(args.save_dir, "noise_video.gif"))
 
     # Perturbation alone, amplified for visibility (delta is in [-eps, eps] ~ [-13, 13];
     # amplify so it spans most of [0,255])

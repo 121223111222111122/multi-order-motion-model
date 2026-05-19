@@ -1,0 +1,28 @@
+{
+  "eps_pixel": 25.0,
+  "eps_pct_of_255": 9.803921568627452,
+  "steps": 50,
+  "alpha": 2.5,
+  "smooth_factor": 8,
+  "mask_coverage_pct": 55.62947392463684,
+  "clean": {
+    "rms_flow": 7.934325218200684,
+    "rms_flow_1": 8.243952751159668,
+    "mean_flow_mag": 7.729982852935791,
+    "mean_flow_mag_1": 8.078404426574707
+  },
+  "attack": {
+    "rms_flow": 0.11203303933143616,
+    "rms_flow_1": 0.0023954189382493496,
+    "mean_flow_mag": 0.0725722685456276,
+    "mean_flow_mag_1": 0.0023555185180157423
+  },
+  "random_noise": {
+    "rms_flow": 7.874477863311768,
+    "rms_flow_1": 8.253207206726074,
+    "mean_flow_mag": 7.646017551422119,
+    "mean_flow_mag_1": 8.087224006652832
+  },
+  "delta_actual_max_abs": 25.0,
+  "delta_actual_mean_abs": 10.4718656539917
+}

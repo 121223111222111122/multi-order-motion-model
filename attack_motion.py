@@ -1,5 +1,40 @@
 """White-box PGD attack on the multi-order motion model.
 
+WHY THIS EXISTS
+  Goal: test whether an adversarial attack on this model of human motion processing
+  ALSO fools humans. If a perturbation that breaks the model's motion percept also
+  breaks a person's, that is evidence the model and the human visual system share the
+  underlying computation. So the perturbation must be something humans can actually
+  perceive as motion -- not invisible pixel noise -- which drives the design choices
+  below (coherent drift, bandwidth limiting, EOT).
+
+THE TARGET
+  FFV1DNNV2, a biologically-inspired optical-flow net: a first-order motion-energy
+  front end (V1-like, luminance-defined motion), a recurrent graph network (MT-like
+  integration), and a second-order pathway (contrast/texture-defined motion). It is
+  meant to mirror human motion perception, which is what makes it worth attacking.
+
+THE MASK
+  We corrupt motion only inside a target region. The mask is the model's OWN MaskCut
+  segmentation of the salient moving region (from its attention map). It restricts the
+  LOSS (which output region we want wrong), NOT where the perturbation may live --
+  delta can be placed anywhere, including outside the mask, to corrupt the masked flow.
+
+KNOWN OBSTACLES TO HUMAN TRANSFER
+  - Transparency / common fate: a coherent overlay moving differently from the scene
+    tends to be scissioned off as a separate transparent surface, so it may not alter
+    the scene's PERCEIVED motion even when it fools the model.
+  - Depth: the dense warp inherits parallax/looming structure from the flow field but
+    does NOT model occlusion/disparity, so it can be depth-inconsistent (smears at
+    depth edges), which worsens the transparency problem.
+  - Nulling vs reversal: making humans see NO motion (objective=zero) is likely easier
+    to induce than REVERSED motion (objective=counter) -- balanced opposing motion
+    collapsing to "no motion" is a well-established human effect (motion nulling).
+
+CONTROL
+  A matched-norm random-noise condition is always run, to confirm the model is not
+  merely fragile to any noise (it is not) -- the adversarial effect must exceed it.
+
 Perturbation parameterizations:
   - free  : independent per-frame delta (max model attackability, but incoherent
             per-frame hash that humans scission off / don't perceive as motion).

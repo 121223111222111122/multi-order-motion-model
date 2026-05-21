@@ -1,0 +1,39 @@
+{
+  "eps_pixel": 25.0,
+  "eps_pct_of_255": 9.803921568627452,
+  "steps": 150,
+  "alpha": 2.5,
+  "smooth_factor": 4,
+  "n_eot": 3,
+  "objective": "zero",
+  "drift_enabled": true,
+  "drift_mode": "dense",
+  "drift_vec": null,
+  "mask_coverage_pct": 55.62947392463684,
+  "clean": {
+    "rms_flow": 7.934325218200684,
+    "rms_flow_1": 8.243952751159668,
+    "mean_flow_mag": 7.729982852935791,
+    "mean_flow_mag_1": 8.078404426574707
+  },
+  "attack": {
+    "rms_flow": 0.003814679803326726,
+    "rms_flow_1": 0.003738695289939642,
+    "mean_flow_mag": 0.0039395964704453945,
+    "mean_flow_mag_1": 0.0037555487360805273
+  },
+  "random_noise": {
+    "rms_flow": 8.019250869750977,
+    "rms_flow_1": 8.234458923339844,
+    "mean_flow_mag": 7.768736839294434,
+    "mean_flow_mag_1": 8.069548606872559
+  },
+  "directional_alignment_vs_clean": {
+    "attack_vs_clean": 0.47131285071372986,
+    "noise_vs_clean": 0.9731767177581787,
+    "attack_vs_clean_first": 0.4989292025566101,
+    "noise_vs_clean_first": 0.9999608993530273
+  },
+  "delta_actual_max_abs": 25.000003814697266,
+  "delta_actual_mean_abs": 12.079415321350098
+}

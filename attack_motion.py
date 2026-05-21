@@ -1,22 +1,31 @@
 """White-box PGD attack on the multi-order motion model.
 
-v1 design (see chat for rationale):
-  - Per-frame perturbation delta of shape [T, 3, H, W], L_inf budget eps = 13/255
-    (i.e. ~5% of full-scale RGB). Perturbation may be added anywhere on the frame.
-  - Loss: minimize ||flow_seq * mask||^2 + ||flow_seq_1 * mask||^2 inside a moving-object
-    mask. mask comes from the repo's maskcut_from_motion using the model's own attention,
-    optionally refined by DenseCRF.
-  - Both pathways in the loss because st_component1 is detached internally, so the
-    combined-output gradient does NOT flow through the first-order branch.
-  - 50 PGD steps, signed-gradient step alpha = eps/10, one random init.
-  - No EOT / no TV. Treat this as a pipeline test, not a result fit for humans.
+Perturbation parameterizations:
+  - free  : independent per-frame delta (max model attackability, but incoherent
+            per-frame hash that humans scission off / don't perceive as motion).
+  - global: a single texture rigidly drifting opposite the mean masked flow
+            (coherent, human-visible; correct only for translational scene flow).
+  - dense : a single texture advected each frame along the REVERSE of the scene's
+            per-pixel flow via compositional grid_sample warps. Handles translation,
+            rotation, divergence and any mix -- it replays the scene's motion backward,
+            so the perturbation locally counters the perceived flow everywhere.
+
+Bandwidth limiting (smooth_factor): delta parameterized at H/k x W/k, upsampled, so
+the perturbation lives at a human-visible spatial scale (not pixel hash).
+EOT (n_eot): gradients averaged over small random augmentations for robustness.
+Both pathways in the loss: the model detaches the first-order branch internally, so
+flow_seq (combined) AND flow_seq_1 (first-order) must both appear to get gradient
+through both. First-order is the human-relevant channel.
+
+Objective:
+  zero    - minimize ||flow * mask||^2          (model sees no motion / nulling)
+  counter - minimize ||(flow + clean_flow) * mask||^2  (model sees reversed motion)
 
 Outputs to --save_dir:
-  - clean.gif, attacked.gif, noise.gif: flow visualizations
-  - perturbation.gif: delta amplified for visibility
-  - perturbed_video.gif: the attacker's input (x + delta) shown to the model
-  - mask.png: the optimization mask
-  - metrics.json: numerical comparison (clean vs attack vs random noise)
+  clean.png / attacked.png / noise.png    - flow quiver overlays (one per condition)
+  clean_video.gif / attacked_video.gif / noise_video.gif - videos shown to the model
+  perturbation.gif                         - delta amplified for visibility
+  mask.png, metrics.json
 """
 from __future__ import print_function, division
 import argparse
@@ -48,7 +57,7 @@ flow_to_image = flow_to_image_relative
 
 
 # --------------------------------------------------------------------------------------
-# Image / IO helpers (mirrors infer_motion.py so a zero-delta run reproduces its output)
+# Image / IO helpers
 # --------------------------------------------------------------------------------------
 def load_image(imfile):
     img = Image.open(imfile)
@@ -152,8 +161,6 @@ def build_model(ckpt_path):
     model.load_state_dict(state, strict=True)
     model = model.module.cuda().eval()
     # Override the no-grad preprocess so adversarial gradient can flow to delta.
-    # Instance-level attribute shadows the class method; since the original method
-    # doesn't actually use `self`, no rebinding needed.
     model.data_preprocess = data_preprocess_with_grad
     return model
 
@@ -162,7 +169,6 @@ def run_model(model, frames, iters=8, requires_grad=False):
     """frames: list of [1,3,H,W] 0-255 tensors. Returns the results_dict."""
     ctx = torch.enable_grad() if requires_grad else torch.no_grad()
     with ctx:
-        # mix_enable=False keeps everything in fp32, simpler gradient story
         return model.forward(frames, mix_enable=False, layer=iters)
 
 
@@ -187,15 +193,7 @@ def extract_mask(model, frames, iters, image_uint8, tau=0.15, use_crf=True):
 # PGD attack
 # --------------------------------------------------------------------------------------
 def apply_eot_aug(perturbed, jitter_px=2, brightness_jitter=0.03, noise_std=0.5):
-    """Small input augmentation for EOT. perturbed: [T, 3, H, W] in 0-255 space.
-
-    - Random integer translation by up to +/- jitter_px (same shift for all frames,
-      preserves the underlying motion structure).
-    - Multiplicative brightness in (1 +/- brightness_jitter).
-    - Additive Gaussian noise with std noise_std (in pixel units).
-
-    All small enough that motion content is preserved; large enough that pixel-level
-    overfitting in delta gets penalized."""
+    """Small input augmentation for EOT. perturbed: [T, 3, H, W] in 0-255 space."""
     dx = random.randint(-jitter_px, jitter_px)
     dy = random.randint(-jitter_px, jitter_px)
     b = 1.0 + random.uniform(-brightness_jitter, brightness_jitter)
@@ -209,25 +207,18 @@ def apply_eot_aug(perturbed, jitter_px=2, brightness_jitter=0.03, noise_std=0.5)
 
 def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                smooth_factor=1, n_eot=1,
-               clean_flow=None, clean_flow_1=None, objective="zero"):
-    """PGD with bandwidth limiting (smooth_factor), EOT, and configurable objective.
+               clean_flow=None, clean_flow_1=None, objective="zero",
+               drift_vec=None, warp_flow=None):
+    """PGD with bandwidth limiting, EOT, configurable objective and parameterization.
 
-    Bandwidth limiting: delta is parameterized at H/k x W/k and bilinearly upsampled
-    so the perturbation lives at a spatial scale humans process.
-
-    EOT: at each PGD step, average the gradient over `n_eot` random augmentations
-    (translation/brightness/noise) of the perturbed input. Prevents the optimizer
-    from finding brittle pixel-level patterns that only fool this model.
-
-    Objective:
-        "zero"    - minimize ||flow * mask||^2          (model sees no motion)
-        "counter" - minimize ||(flow + clean_flow) * mask||^2
-                    (push model toward seeing motion in the OPPOSITE direction;
-                    encourages the perturbation to itself carry counter-motion
-                    energy, which is what humans would perceive)."""
+    drift_vec set  -> global mode (single texture, rigid uniform drift).
+    warp_flow set  -> dense mode (single texture advected along reversed per-pixel flow).
+    neither        -> free mode (independent per-frame delta).
+    """
     T = len(frames)
     _, _, H, W = frames[0].shape
     frames_stack = torch.cat(frames, dim=0)
+    mid = T // 2
 
     if objective == "counter":
         assert clean_flow is not None and clean_flow_1 is not None, \
@@ -237,16 +228,59 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
 
     Hs = max(1, H // smooth_factor)
     Ws = max(1, W // smooth_factor)
+    if warp_flow is not None:
+        mode = "dense"
+    elif drift_vec is not None:
+        mode = "global"
+    else:
+        mode = "free"
+    single_texture = mode in ("global", "dense")
     print(f"[attack] delta parameterized at {Hs}x{Ws}, upsampled {smooth_factor}x to {H}x{W}")
-    print(f"[attack] objective={objective}  n_eot={n_eot}")
+    print(f"[attack] objective={objective}  n_eot={n_eot}  drift_mode={mode}  global_vec={drift_vec}")
 
-    delta_lr = torch.empty(T, 3, Hs, Ws, device=DEVICE).uniform_(-eps, eps)
+    n_param = 1 if single_texture else T
+    delta_lr = torch.empty(n_param, 3, Hs, Ws, device=DEVICE).uniform_(-eps, eps)
     delta_lr.requires_grad_(True)
 
-    def upsample(d):
-        if smooth_factor == 1:
-            return d
-        return F.interpolate(d, size=(H, W), mode="bilinear", align_corners=True)
+    # Precompute the two sampling grids for the dense compositional warp.
+    if mode == "dense":
+        ys, xs = torch.meshgrid(torch.arange(H, device=DEVICE), torch.arange(W, device=DEVICE), indexing="ij")
+        base_xy = torch.stack([xs, ys], dim=-1).float()  # [H, W, 2] in (x, y) pixels
+        f = warp_flow.detach().permute(0, 2, 3, 1)        # [1, H, W, 2]
+
+        def _grid(sign):
+            coords = base_xy[None] + sign * f             # [1, H, W, 2]
+            cx = coords[..., 0] % W                        # circular wrap (infinite scrolling texture)
+            cy = coords[..., 1] % H
+            gx = 2.0 * cx / (W - 1) - 1.0
+            gy = 2.0 * cy / (H - 1) - 1.0
+            return torch.stack([gx, gy], dim=-1)           # [1, H, W, 2]
+
+        grid_plus = _grid(+1.0)   # sample at x+flow  -> advances perturbation by -flow (forward in time)
+        grid_minus = _grid(-1.0)  # sample at x-flow  -> advances perturbation by +flow (backward in time)
+
+    def make_perturbation(d):
+        base = d if smooth_factor == 1 else F.interpolate(d, size=(H, W), mode="bilinear", align_corners=True)
+        if mode == "free":
+            return base  # [T, 3, H, W]
+        if mode == "global":
+            vx, vy = drift_vec
+            out_frames = []
+            for t in range(T):
+                dx = int(round(vx * (t - mid)))
+                dy = int(round(vy * (t - mid)))
+                out_frames.append(torch.roll(base, shifts=(dy, dx), dims=(-2, -1)))  # base is [1,3,H,W]
+            return torch.cat(out_frames, dim=0)
+        # dense: replay the scene flow backward by composing single-frame warps
+        out_frames = [None] * T
+        out_frames[mid] = base  # [1, 3, H, W]
+        for t in range(mid + 1, T):
+            out_frames[t] = F.grid_sample(out_frames[t - 1], grid_plus, mode="bilinear",
+                                          padding_mode="border", align_corners=True)
+        for t in range(mid - 1, -1, -1):
+            out_frames[t] = F.grid_sample(out_frames[t + 1], grid_minus, mode="bilinear",
+                                          padding_mode="border", align_corners=True)
+        return torch.cat(out_frames, dim=0)  # [T, 3, H, W]
 
     def compute_loss(out):
         flow = out["flow_seq"][-1]
@@ -262,11 +296,8 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
         last_flow, last_flow_1, last_loss = None, None, None
 
         for eot_i in range(n_eot):
-            delta = upsample(delta_lr)
+            delta = make_perturbation(delta_lr)
             perturbed = (frames_stack + delta).clamp(0.0, 255.0)
-            # First sample uses unaugmented input (so step-end metrics reflect the
-            # true loss on the actual perturbed video); subsequent samples are
-            # randomly augmented to make the gradient EOT-style.
             if eot_i > 0:
                 perturbed = apply_eot_aug(perturbed)
             perturbed_list = [perturbed[i : i + 1] for i in range(T)]
@@ -294,13 +325,13 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                   f"masked_rms[flow]={flow_mag:.3f}  masked_rms[flow_1]={flow_1_mag:.3f}")
 
     delta_lr = delta_lr.detach()
-    delta_final = upsample(delta_lr)
+    delta_final = make_perturbation(delta_lr)
     perturbed_list = [(frames_stack[i : i + 1] + delta_final[i : i + 1]).clamp(0, 255) for i in range(T)]
     return perturbed_list, delta_final
 
 
 # --------------------------------------------------------------------------------------
-# Evaluation: masked flow magnitude under each condition
+# Evaluation
 # --------------------------------------------------------------------------------------
 def masked_flow_magnitudes(model, frames, mask_t, iters):
     out = run_model(model, frames, iters=iters, requires_grad=False)
@@ -312,6 +343,19 @@ def masked_flow_magnitudes(model, frames, mask_t, iters):
         "mean_flow_mag":   (flow.norm(dim=1, keepdim=True) * mask_t).mean().item(),
         "mean_flow_mag_1": (flow_1.norm(dim=1, keepdim=True) * mask_t).mean().item(),
     }, out
+
+
+def directional_alignment(flow, ref_flow, mask_t):
+    """Mean cosine similarity between flow and ref_flow over the masked region.
+      +1 = same direction as clean   0 = orthogonal / no motion   -1 = exactly opposite.
+    Only counts pixels where both vectors have non-trivial magnitude."""
+    dot = (flow * ref_flow).sum(dim=1, keepdim=True)
+    norm = flow.norm(dim=1, keepdim=True) * ref_flow.norm(dim=1, keepdim=True)
+    cos = dot / (norm + 1e-6)
+    valid = (mask_t > 0.5) & (ref_flow.norm(dim=1, keepdim=True) > 0.5)
+    if valid.sum() == 0:
+        return float("nan")
+    return cos[valid].mean().item()
 
 
 # --------------------------------------------------------------------------------------
@@ -329,13 +373,21 @@ def main():
     ap.add_argument("--mask-tau", type=float, default=0.15, help="MaskCut threshold")
     ap.add_argument("--no-crf", action="store_true", help="skip DenseCRF refinement of the mask")
     ap.add_argument("--smooth-factor", type=int, default=4,
-                    help="parameterize delta at H/k x W/k, upsample to (H,W); k=1 means per-pixel (likely won't transfer to humans), k=4-8 forces a human-visible spatial scale")
+                    help="parameterize delta at H/k x W/k, upsample to (H,W); k=4-8 forces a human-visible spatial scale")
     ap.add_argument("--max-side", type=int, default=None,
                     help="downscale input so longer side is <= this (helps with GPU memory)")
     ap.add_argument("--n-eot", type=int, default=3,
                     help="EOT samples per PGD step (>=2 averages gradients over random augmentations; 1 disables EOT)")
     ap.add_argument("--objective", choices=["zero", "counter"], default="counter",
-                    help="zero: minimize ||flow||^2 (see no motion); counter: push toward OPPOSITE of clean flow (see counter-motion). counter is more likely to produce a perturbation that engages human motion processing.")
+                    help="zero: minimize ||flow||^2 (see no motion); counter: push toward OPPOSITE of clean flow")
+    ap.add_argument("--drift", action="store_true",
+                    help="constrain the perturbation to a single coherent moving texture (human-visible) instead of free per-frame noise")
+    ap.add_argument("--drift-mode", choices=["global", "dense"], default="dense",
+                    help="global: rigid uniform drift opposite the mean masked flow (translational only). dense: advect along reverse of per-pixel scene flow (handles rotation/divergence).")
+    ap.add_argument("--drift-scale", type=float, default=1.0,
+                    help="[global mode] multiplier on the drift speed (1.0 = match the mean masked flow speed)")
+    ap.add_argument("--drift-vx", type=float, default=None, help="[global mode] override drift velocity x (px/frame)")
+    ap.add_argument("--drift-vy", type=float, default=None, help="[global mode] override drift velocity y (px/frame)")
     args = ap.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     alpha = args.alpha if args.alpha is not None else args.eps / 10.0
@@ -367,11 +419,32 @@ def main():
     # === Clean baseline ===
     clean_metrics, clean_out = masked_flow_magnitudes(model, frames, mask_t, args.iters)
     print(f"[clean] {clean_metrics}")
-    # Keep final flow tensors from both pathways (needed for counter-motion target and visualization)
     clean_flow_final = clean_out["flow_seq"][-1].detach().clone()
     clean_flow_1_final = clean_out["flow_seq_1"][-1].detach().clone()
     del clean_out
     torch.cuda.empty_cache()
+
+    # === Determine perturbation parameterization (drift mode only) ===
+    drift_vec = None
+    warp_flow = None
+    if args.drift and args.drift_mode == "dense":
+        warp_flow = clean_flow_final
+        m = mask_t > 0.5
+        mvx = clean_flow_final[:, 0:1][m].mean().item()
+        mvy = clean_flow_final[:, 1:2][m].mean().item()
+        print(f"[drift] DENSE mode: advecting texture along reverse of per-pixel scene flow")
+        print(f"[drift] mean masked flow=({mvx:.2f},{mvy:.2f}) px/frame (field is per-pixel, not just this mean)")
+    elif args.drift and args.drift_mode == "global":
+        if args.drift_vx is not None and args.drift_vy is not None:
+            drift_vec = (args.drift_vx, args.drift_vy)
+            print(f"[drift] GLOBAL mode: manual drift velocity {drift_vec} px/frame")
+        else:
+            m = mask_t > 0.5
+            mean_vx = clean_flow_final[:, 0:1][m].mean().item()
+            mean_vy = clean_flow_final[:, 1:2][m].mean().item()
+            drift_vec = (-mean_vx * args.drift_scale, -mean_vy * args.drift_scale)
+            print(f"[drift] GLOBAL mode: mean masked flow=({mean_vx:.2f},{mean_vy:.2f}) px/frame")
+            print(f"[drift] -> drift velocity ({drift_vec[0]:.2f},{drift_vec[1]:.2f}) px/frame (opposite, scale={args.drift_scale})")
 
     # === PGD attack ===
     print(f"[attack] running PGD ({args.steps} steps, smooth_factor={args.smooth_factor}, n_eot={args.n_eot}, objective={args.objective})")
@@ -382,10 +455,13 @@ def main():
                                          n_eot=args.n_eot,
                                          clean_flow=clean_flow_final,
                                          clean_flow_1=clean_flow_1_final,
-                                         objective=args.objective)
+                                         objective=args.objective,
+                                         drift_vec=drift_vec,
+                                         warp_flow=warp_flow)
     torch.cuda.empty_cache()
     attack_metrics, attack_out = masked_flow_magnitudes(model, perturbed_frames, mask_t, args.iters)
     attack_flow_final = attack_out["flow_seq"][-1].detach().clone()
+    attack_flow_1_final = attack_out["flow_seq_1"][-1].detach().clone()
     del attack_out
     torch.cuda.empty_cache()
     print(f"[attack] {attack_metrics}")
@@ -397,9 +473,21 @@ def main():
     rand_frames = [rand_perturbed[i : i + 1] for i in range(T)]
     noise_metrics, noise_out = masked_flow_magnitudes(model, rand_frames, mask_t, args.iters)
     noise_flow_final = noise_out["flow_seq"][-1].detach().clone()
+    noise_flow_1_final = noise_out["flow_seq_1"][-1].detach().clone()
     del noise_out
     torch.cuda.empty_cache()
     print(f"[noise] {noise_metrics}")
+
+    # === Directional alignment vs clean, per pathway (combined readout AND first-order) ===
+    align = {
+        "attack_vs_clean":        directional_alignment(attack_flow_final, clean_flow_final, mask_t),
+        "noise_vs_clean":         directional_alignment(noise_flow_final, clean_flow_final, mask_t),
+        "attack_vs_clean_first":  directional_alignment(attack_flow_1_final, clean_flow_1_final, mask_t),
+        "noise_vs_clean_first":   directional_alignment(noise_flow_1_final, clean_flow_1_final, mask_t),
+    }
+    print(f"[direction] combined: cosine(attacked,clean)={align['attack_vs_clean']:.3f}  noise={align['noise_vs_clean']:.3f}")
+    print(f"[direction] first-order: cosine(attacked,clean)={align['attack_vs_clean_first']:.3f}  noise={align['noise_vs_clean_first']:.3f}")
+    print(f"[direction] (want both attacked values near -1; first-order is the human-relevant channel)")
 
     # === Save artifacts ===
     metrics = {
@@ -410,19 +498,21 @@ def main():
         "smooth_factor": args.smooth_factor,
         "n_eot": args.n_eot,
         "objective": args.objective,
+        "drift_enabled": bool(args.drift),
+        "drift_mode": (args.drift_mode if args.drift else None),
+        "drift_vec": list(drift_vec) if drift_vec is not None else None,
         "mask_coverage_pct": float(100 * mask_np.mean()),
         "clean": clean_metrics,
         "attack": attack_metrics,
         "random_noise": noise_metrics,
+        "directional_alignment_vs_clean": align,
         "delta_actual_max_abs": float(delta.abs().max().item()),
         "delta_actual_mean_abs": float(delta.abs().mean().item()),
     }
     with open(os.path.join(args.save_dir, "metrics.json"), "w") as f:
         json.dump(metrics, f, indent=2)
 
-    # Flow quivers: ONE PNG per condition (the model produces one flow per 15-frame
-    # window, so an animation would just show stationary arrows). Use the middle
-    # frame as the canvas.
+    # Flow quivers: ONE PNG per condition (model produces one flow per 15-frame window).
     print(f"[save] writing visualizations to {args.save_dir}")
     mid = T // 2
     Image.fromarray(quiver_overlay(to_numpy_uint8(frames[mid]), clean_flow_final,
@@ -435,9 +525,7 @@ def main():
                                    title=f"NOISE  rms={noise_metrics['rms_flow']:.3f}")).save(
         os.path.join(args.save_dir, "noise.png"))
 
-    # Input frames as separate animations (no overlay): the question these answer
-    # is "does the moving object still visibly move?" - which can't be answered
-    # from a still arrow plot.
+    # Input frames as separate animations (no overlay).
     save_gif([to_numpy_uint8(f) for f in frames],
              os.path.join(args.save_dir, "clean_video.gif"))
     save_gif([to_numpy_uint8(f) for f in perturbed_frames],
@@ -445,8 +533,7 @@ def main():
     save_gif([to_numpy_uint8(f) for f in rand_frames],
              os.path.join(args.save_dir, "noise_video.gif"))
 
-    # Perturbation alone, amplified for visibility (delta is in [-eps, eps] ~ [-13, 13];
-    # amplify so it spans most of [0,255])
+    # Perturbation alone, amplified for visibility.
     amp = 255.0 / (2 * args.eps)
     pert_uint8 = ((delta * amp) + 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
     pert_uint8 = pert_uint8.transpose(0, 2, 3, 1)  # [T, H, W, 3]

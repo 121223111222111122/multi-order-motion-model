@@ -394,6 +394,67 @@ def directional_alignment(flow, ref_flow, mask_t):
 
 
 # --------------------------------------------------------------------------------------
+# Target weight maps (what region of the flow we try to corrupt)
+# --------------------------------------------------------------------------------------
+def periphery_weight(H, W, inner_frac=0.33, outer_frac=0.95):
+    """Radial weight in [0,1]: ~0 in the central ellipse (r < inner_frac), ramping
+    smoothly to 1 by r = outer_frac, where r is normalized so 1.0 is the edge midpoint.
+    Targets the peripheral visual field, which dominates self-motion / vection."""
+    ys = (torch.arange(H, device=DEVICE).float() - (H - 1) / 2) / ((H - 1) / 2)
+    xs = (torch.arange(W, device=DEVICE).float() - (W - 1) / 2) / ((W - 1) / 2)
+    Y, X = torch.meshgrid(ys, xs, indexing="ij")
+    r = torch.sqrt(X ** 2 + Y ** 2)
+    w = ((r - inner_frac) / max(1e-6, (outer_frac - inner_frac))).clamp(0.0, 1.0)
+    return w[None, None]  # [1, 1, H, W]
+
+
+def lowpass_flow_weight(clean_flow, sigma_frac=0.1):
+    """Low-pass the clean flow magnitude to isolate the smooth, large-field component
+    (the globally-coherent / self-motion-consistent flow that drives vection; localized
+    object motion is blurred away). Returns [1,1,H,W] normalized to [0,1]."""
+    mag = clean_flow.norm(dim=1, keepdim=True)  # [1,1,H,W]
+    H, W = mag.shape[-2:]
+    sigma = max(1.0, sigma_frac * min(H, W))
+    k = int(2 * round(3 * sigma) + 1)
+    coords = torch.arange(k, device=mag.device).float() - (k - 1) / 2
+    g = torch.exp(-(coords ** 2) / (2 * sigma ** 2))
+    g = g / g.sum()
+    blurred = F.conv2d(mag, g.view(1, 1, 1, k), padding=(0, k // 2))
+    blurred = F.conv2d(blurred, g.view(1, 1, k, 1), padding=(k // 2, 0))
+    return blurred / (blurred.max() + 1e-6)
+
+
+def build_target_mask(mode, clean_out, mid_img, H, W, args):
+    """Build the soft target-weight map [1,1,H,W] that weights the loss.
+      maskcut    - the model's MaskCut object/region segmentation (binary).
+      global     - whole frame.
+      periphery  - radial periphery weight (vection-dominant field; spares the fovea).
+      selfmotion - periphery x low-pass(clean flow): globally-coherent peripheral flow.
+    """
+    if mode == "maskcut":
+        attention = clean_out["flow_attn"][-1]
+        bip, _ = maskcut.maskcut_from_motion(attention, patch_size=8, tau=args.mask_tau, N=1)
+        mask = bip[0].astype(np.float32)
+        if not args.no_crf and HAS_CRF:
+            try:
+                refined = densecrf(mid_img, mask)
+                mask = (refined >= 0.5).astype(np.float32)
+            except Exception as e:
+                print(f"[mask] CRF refinement failed ({e}); using raw MaskCut output.")
+        mask_t = torch.from_numpy(mask).to(DEVICE)[None, None].float()
+        if mask_t.shape[-2:] != (H, W):
+            mask_t = F.interpolate(mask_t, size=(H, W), mode="nearest")
+        return mask_t
+    if mode == "global":
+        return torch.ones(1, 1, H, W, device=DEVICE)
+    if mode == "periphery":
+        return periphery_weight(H, W, args.periphery_inner)
+    if mode == "selfmotion":
+        return periphery_weight(H, W, args.periphery_inner) * lowpass_flow_weight(clean_out["flow_seq"][-1], args.lowpass_sigma)
+    raise ValueError(f"unknown mask mode: {mode}")
+
+
+# --------------------------------------------------------------------------------------
 # Main
 # --------------------------------------------------------------------------------------
 def main():
@@ -423,6 +484,12 @@ def main():
                     help="[global mode] multiplier on the drift speed (1.0 = match the mean masked flow speed)")
     ap.add_argument("--drift-vx", type=float, default=None, help="[global mode] override drift velocity x (px/frame)")
     ap.add_argument("--drift-vy", type=float, default=None, help="[global mode] override drift velocity y (px/frame)")
+    ap.add_argument("--mask-mode", choices=["maskcut", "global", "periphery", "selfmotion"], default="maskcut",
+                    help="maskcut: model's object/region cut. global: whole frame. periphery: radial periphery (vection-dominant). selfmotion: periphery x low-pass(flow) = globally-coherent peripheral flow.")
+    ap.add_argument("--periphery-inner", type=float, default=0.33,
+                    help="[periphery/selfmotion] normalized radius (0-1) of the central field left untouched")
+    ap.add_argument("--lowpass-sigma", type=float, default=0.1,
+                    help="[selfmotion] Gaussian sigma (fraction of min(H,W)) for isolating large-field flow")
     args = ap.parse_args()
     os.makedirs(args.save_dir, exist_ok=True)
     alpha = args.alpha if args.alpha is not None else args.eps / 10.0
@@ -435,29 +502,32 @@ def main():
     T, _, _, H, W = (len(frames),) + tuple(frames[0].shape)
     print(f"[setup] T={T}  H={H}  W={W}")
 
-    # Mask from clean forward pass
+    # === Clean forward pass: flow (both pathways) + attention (for maskcut mode) ===
     mid_img = to_numpy_uint8(frames[len(frames) // 2])
-    mask_np = extract_mask(model, frames, args.iters, mid_img,
-                           tau=args.mask_tau, use_crf=not args.no_crf)
-    print(f"[mask] mask covers {100*mask_np.mean():.1f}% of frame area")
-    Image.fromarray((mask_np * 255).astype(np.uint8)).save(os.path.join(args.save_dir, "mask.png"))
-
-    if mask_np.sum() < 100:
-        print("[mask] WARNING: mask is essentially empty. Try lowering --mask-tau.")
-        return
-
-    # Resize mask to flow output resolution (= input resolution here)
-    mask_t = torch.from_numpy(mask_np).to(DEVICE)[None, None]
-    if mask_t.shape[-2:] != (H, W):
-        mask_t = F.interpolate(mask_t, size=(H, W), mode="nearest")
-
-    # === Clean baseline ===
-    clean_metrics, clean_out = masked_flow_magnitudes(model, frames, mask_t, args.iters)
-    print(f"[clean] {clean_metrics}")
+    clean_out = run_model(model, frames, iters=args.iters, requires_grad=False)
     clean_flow_final = clean_out["flow_seq"][-1].detach().clone()
     clean_flow_1_final = clean_out["flow_seq_1"][-1].detach().clone()
+
+    # === Build the target weight map per --mask-mode ===
+    mask_t = build_target_mask(args.mask_mode, clean_out, mid_img, H, W, args).float()
     del clean_out
     torch.cuda.empty_cache()
+    mask_coverage = float(mask_t.mean().item())
+    wt_np = mask_t.squeeze().detach().cpu().numpy()
+    Image.fromarray((wt_np / (wt_np.max() + 1e-6) * 255).astype(np.uint8)).save(os.path.join(args.save_dir, "mask.png"))
+    print(f"[mask] mode={args.mask_mode}  mean weight={mask_coverage:.3f}")
+    if (mask_t > 0.01).float().mean().item() < 0.001:
+        print("[mask] WARNING: target weight is essentially empty.")
+        return
+
+    # === Clean baseline metrics over the weighted region (reuse the forward pass above) ===
+    clean_metrics = {
+        "rms_flow":   (clean_flow_final * mask_t).pow(2).mean().sqrt().item(),
+        "rms_flow_1": (clean_flow_1_final * mask_t).pow(2).mean().sqrt().item(),
+        "mean_flow_mag":   (clean_flow_final.norm(dim=1, keepdim=True) * mask_t).mean().item(),
+        "mean_flow_mag_1": (clean_flow_1_final.norm(dim=1, keepdim=True) * mask_t).mean().item(),
+    }
+    print(f"[clean] {clean_metrics}")
 
     # === Determine perturbation parameterization (drift mode only) ===
     drift_vec = None
@@ -536,7 +606,8 @@ def main():
         "drift_enabled": bool(args.drift),
         "drift_mode": (args.drift_mode if args.drift else None),
         "drift_vec": list(drift_vec) if drift_vec is not None else None,
-        "mask_coverage_pct": float(100 * mask_np.mean()),
+        "mask_target_mode": args.mask_mode,
+        "mask_mean_weight": mask_coverage,
         "clean": clean_metrics,
         "attack": attack_metrics,
         "random_noise": noise_metrics,

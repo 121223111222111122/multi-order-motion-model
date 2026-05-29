@@ -298,11 +298,13 @@ def apply_eot_aug(perturbed, jitter_px=2, brightness_jitter=0.03, noise_std=0.5)
 def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                smooth_factor=1, n_eot=1,
                clean_flow=None, clean_flow_1=None, objective="zero",
-               drift_vec=None, warp_flow=None):
+               drift_vec=None, warp_flow=None,
+               warp_mode=False, warp_eps=4.0):
     """PGD with bandwidth limiting, EOT, configurable objective and parameterization.
 
     drift_vec set  -> global mode (single texture, rigid uniform drift).
     warp_flow set  -> dense mode (single texture advected along reversed per-pixel flow).
+    warp_mode=True -> warp mode (displace scene pixels via grid_sample; no foreign texture).
     neither        -> free mode (independent per-frame delta).
     """
     T = len(frames)
@@ -318,19 +320,24 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
 
     Hs = max(1, H // smooth_factor)
     Ws = max(1, W // smooth_factor)
-    if warp_flow is not None:
+    if warp_mode:
+        mode = "warp"
+    elif warp_flow is not None:
         mode = "dense"
     elif drift_vec is not None:
         mode = "global"
     else:
         mode = "free"
     single_texture = mode in ("global", "dense")
-    print(f"[attack] delta parameterized at {Hs}x{Ws}, upsampled {smooth_factor}x to {H}x{W}")
-    print(f"[attack] objective={objective}  n_eot={n_eot}  drift_mode={mode}  global_vec={drift_vec}")
+    print(f"[attack] param at {Hs}x{Ws}, upsampled {smooth_factor}x to {H}x{W}")
+    print(f"[attack] objective={objective}  n_eot={n_eot}  mode={mode}  global_vec={drift_vec}")
 
-    n_param = 1 if single_texture else T
-    delta_lr = torch.empty(n_param, 3, Hs, Ws, device=DEVICE).uniform_(-eps, eps)
-    delta_lr.requires_grad_(True)
+    # Identity grid (normalized [-1,1] coords) for dense and warp modes
+    if mode in ("dense", "warp"):
+        ys_n = torch.linspace(-1, 1, H, device=DEVICE)
+        xs_n = torch.linspace(-1, 1, W, device=DEVICE)
+        _gy, _gx = torch.meshgrid(ys_n, xs_n, indexing="ij")
+        identity_grid = torch.stack([_gx, _gy], dim=-1)[None]  # [1, H, W, 2]
 
     # Precompute the two sampling grids for the dense compositional warp.
     if mode == "dense":
@@ -348,6 +355,31 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
 
         grid_plus = _grid(+1.0)   # sample at x+flow  -> advances perturbation by -flow (forward in time)
         grid_minus = _grid(-1.0)  # sample at x-flow  -> advances perturbation by +flow (backward in time)
+
+    # Warp mode: learn a per-frame displacement field (in pixel units) that is applied
+    # via grid_sample to the scene's own pixels. No new texture is introduced, so the
+    # human visual system cannot segregate the perturbation as a separate transparent layer.
+    if mode == "warp":
+        def apply_warp_field(wp):
+            """wp: [T, 2, Hs, Ws] pixel-space displacement -> warped frames [T, 3, H, W]."""
+            d = wp if smooth_factor == 1 else F.interpolate(wp, size=(H, W), mode="bilinear", align_corners=True)
+            # Convert pixel displacement to normalized [-1,1] grid offset
+            d_norm = torch.stack([d[:, 0] / ((W - 1) / 2.0),
+                                   d[:, 1] / ((H - 1) / 2.0)], dim=1).permute(0, 2, 3, 1)  # [T, H, W, 2]
+            grid = identity_grid + d_norm  # [T, H, W, 2]  (identity_grid broadcasts from [1,...])
+            return F.grid_sample(frames_stack, grid, mode="bilinear",
+                                 padding_mode="border", align_corners=True)  # [T, 3, H, W]
+
+    # ---- Parameter initialization ----
+    if mode == "warp":
+        # Zero-initialized: start with no displacement (identity warp)
+        param = torch.zeros(T, 2, Hs, Ws, device=DEVICE)
+        budget = warp_eps
+    else:
+        n_param = 1 if single_texture else T
+        param = torch.empty(n_param, 3, Hs, Ws, device=DEVICE).uniform_(-eps, eps)
+        budget = eps
+    param.requires_grad_(True)
 
     def make_perturbation(d):
         base = d if smooth_factor == 1 else F.interpolate(d, size=(H, W), mode="bilinear", align_corners=True)
@@ -382,19 +414,22 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                    (((flow_1 + target_flow_1) * mask_t) ** 2).mean(), flow, flow_1
 
     for step in range(steps):
-        grad_accum = torch.zeros_like(delta_lr)
+        grad_accum = torch.zeros_like(param)
         last_flow, last_flow_1, last_loss = None, None, None
 
         for eot_i in range(n_eot):
-            delta = make_perturbation(delta_lr)
-            perturbed = (frames_stack + delta).clamp(0.0, 255.0)
+            if mode == "warp":
+                perturbed = apply_warp_field(param).clamp(0.0, 255.0)
+            else:
+                delta = make_perturbation(param)
+                perturbed = (frames_stack + delta).clamp(0.0, 255.0)
             if eot_i > 0:
                 perturbed = apply_eot_aug(perturbed)
             perturbed_list = [perturbed[i : i + 1] for i in range(T)]
 
             out = model.forward(perturbed_list, mix_enable=False, layer=iters)
             loss, flow, flow_1 = compute_loss(out)
-            grad = torch.autograd.grad(loss, delta_lr)[0]
+            grad = torch.autograd.grad(loss, param)[0]
             grad_accum = grad_accum + grad
 
             if eot_i == 0:
@@ -403,9 +438,9 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
         grad = grad_accum / n_eot
 
         with torch.no_grad():
-            delta_lr = delta_lr - alpha * grad.sign()
-            delta_lr = torch.clamp(delta_lr, -eps, eps)
-        delta_lr.requires_grad_(True)
+            param = param - alpha * grad.sign()
+            param = torch.clamp(param, -budget, budget)
+        param.requires_grad_(True)
 
         if step % 5 == 0 or step == steps - 1:
             with torch.no_grad():
@@ -413,13 +448,15 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                 flow_1_mag = (last_flow_1 * mask_t).pow(2).mean().sqrt().item()
             print(f"  step {step:3d}  loss={last_loss:.4f}  "
                   f"masked_rms[flow]={flow_mag:.3f}  masked_rms[flow_1]={flow_1_mag:.3f}")
-        # if last_loss < 1e-4:
-        #    print(f"  [early stop] loss={last_loss:.2e} < 1e-4 at step {step}")
-        #    break
 
-    delta_lr = delta_lr.detach()
-    delta_final = make_perturbation(delta_lr)
-    perturbed_list = [(frames_stack[i : i + 1] + delta_final[i : i + 1]).clamp(0, 255) for i in range(T)]
+    param = param.detach()
+    if mode == "warp":
+        warped_final = apply_warp_field(param)
+        delta_final = warped_final - frames_stack  # effective pixel delta for visualization
+        perturbed_list = [warped_final[i : i + 1].clamp(0, 255) for i in range(T)]
+    else:
+        delta_final = make_perturbation(param)
+        perturbed_list = [(frames_stack[i : i + 1] + delta_final[i : i + 1]).clamp(0, 255) for i in range(T)]
     return perturbed_list, delta_final
 
 
@@ -526,7 +563,7 @@ def main():
     ap.add_argument("--iters", type=int, default=6, help="model recurrent iterations; lower to save memory")
     ap.add_argument("--mask-tau", type=float, default=0.15, help="MaskCut threshold")
     ap.add_argument("--no-crf", action="store_true", help="skip DenseCRF refinement of the mask")
-    ap.add_argument("--smooth-factor", type=int, default=4,
+    ap.add_argument("--smooth-factor", type=int, default=8,
                     help="parameterize delta at H/k x W/k, upsample to (H,W); k=4-8 forces a human-visible spatial scale")
     ap.add_argument("--max-side", type=int, default=480.0,
                     help="downscale input so longer side is <= this (helps with GPU memory)")

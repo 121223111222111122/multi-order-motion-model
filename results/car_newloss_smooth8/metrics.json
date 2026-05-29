@@ -1,0 +1,40 @@
+{
+  "eps_pixel": 13.0,
+  "eps_pct_of_255": 5.098039215686274,
+  "steps": 50,
+  "alpha": 1.3,
+  "smooth_factor": 8,
+  "n_eot": 3,
+  "objective": "zero",
+  "drift_enabled": false,
+  "drift_mode": null,
+  "drift_vec": null,
+  "mask_target_mode": "maskcut",
+  "mask_mean_weight": 0.636734127998352,
+  "clean": {
+    "rms_flow": 7.97335147857666,
+    "rms_flow_1": 8.3470458984375,
+    "mean_flow_mag": 8.369552612304688,
+    "mean_flow_mag_1": 8.791351318359375
+  },
+  "attack": {
+    "rms_flow": 0.003923434764146805,
+    "rms_flow_1": 0.027665548026561737,
+    "mean_flow_mag": 0.004354940261691809,
+    "mean_flow_mag_1": 0.004975288175046444
+  },
+  "random_noise": {
+    "rms_flow": 8.052506446838379,
+    "rms_flow_1": 8.350346565246582,
+    "mean_flow_mag": 8.410543441772461,
+    "mean_flow_mag_1": 8.79422378540039
+  },
+  "directional_alignment_vs_clean": {
+    "attack_vs_clean": 0.5354673266410828,
+    "noise_vs_clean": 0.9858859777450562,
+    "attack_vs_clean_first": 0.6152485609054565,
+    "noise_vs_clean_first": 0.9999368190765381
+  },
+  "delta_actual_max_abs": 13.0,
+  "delta_actual_mean_abs": 5.957523822784424
+}

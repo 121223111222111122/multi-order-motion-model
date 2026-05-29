@@ -79,6 +79,8 @@ from io import BytesIO
 import matplotlib.pyplot as plt
 
 from model.nmi6.FFV1MT_MS import FFV1DNNV2
+from torch.cuda.amp import autocast as autocast
+import types
 from utils.flow_utils import flow_to_image_relative
 from mask_cut import maskcut
 try:
@@ -189,6 +191,56 @@ def data_preprocess_with_grad(image_list):
     return image_list, image_list_rgb
 
 
+def forward_for_attack(self, image_list, mix_enable=True, layer=None):
+    """Replacement for FFV1DNNV2.forward that preserves gradient through both pathways.
+
+    The original detaches st_component1 before the fuse layer (line 202 in FFV1MT_MS.py).
+    During training this prevents the combined pathway's loss from updating V1 weights.
+    For our attack (frozen weights), it only severs the gradient from flow_seq back through
+    V1, meaning the combined loss can only attack the second-order (ffv2) pathway.
+    Removing the detach lets flow_seq gradient reach ffv1 as well, so both loss terms
+    attack both pathways:
+      flow_seq_1 loss -> V1 gradient                   (as before)
+      flow_seq   loss -> ffv2 gradient + V1 gradient   (new: V1 now reachable)
+    """
+    if layer is not None:
+        self.MT.num_layers = layer
+        self.num_layers = layer
+    results_dict = {}
+    image_list, image_list_rgb = self.data_preprocess(image_list)
+    image_list = image_list[2:-2]
+    assert len(image_list) == 11 and len(image_list_rgb) == 15
+    B, _, H, W = image_list[0].shape
+    with autocast(enabled=mix_enable):
+        st_component1 = self.ffv1(image_list)
+        st_component2 = self.ffv2(image_list_rgb)
+        flow_0 = [self.decoder(st_component1)]
+        value1, attn1 = self.MT.forward_save_mem(st_component1)
+        flow_1 = [self.decoder(feature) for feature in value1]
+        flow_1_bi = [self.upsample_flow(flows, feature=None, bilinear=True, upsample_factor=8)
+                     for flows in flow_0 + flow_1]
+        flow_1_up = [self.upsample_flow(flows, upsampler=self.upsampler, feature=attn, upsample_factor=8)
+                     for flows, attn in zip(flow_1, attn1)]
+        # No detach: gradient from flow_seq now flows through st_component1 -> ffv1 -> delta.
+        st_component = self.fuse(torch.cat([st_component1, st_component2], dim=1)).square()
+        value_all, attn = self.MT.forward_save_mem(st_component)
+        flows_all = [self.decoder(feature) for feature in value_all]
+        flows_up = [self.upsample_flow(flows, upsampler=self.upsampler, feature=attn, upsample_factor=8)
+                    for flows, attn in zip(flows_all, attn)]
+        flow_bi = [self.upsample_flow(flows, feature=None, bilinear=True, upsample_factor=8)
+                   for flows in flows_all]
+        results_dict["flow_seq"] = flows_up
+        results_dict["flow_seq_bi"] = flow_bi
+        results_dict["flow_seq_1_bi"] = flow_1_bi
+        results_dict["flow_seq_1"] = flow_1_up
+        results_dict["flow_attn"] = attn
+        results_dict["flow_attn_1"] = attn1
+        if layer == 0:
+            results_dict["flow_seq"] = flow_1_bi
+            results_dict["flow_seq_1"] = flow_1_bi
+    return results_dict
+
+
 def build_model(ckpt_path):
     model = FFV1DNNV2(num_scales=8, upsample_factor=8, scale_factor=16, num_layers=6)
     model = nn.DataParallel(model)
@@ -197,6 +249,9 @@ def build_model(ckpt_path):
     model = model.module.cuda().eval()
     # Override the no-grad preprocess so adversarial gradient can flow to delta.
     model.data_preprocess = data_preprocess_with_grad
+    # Override forward to remove the st_component1 detach, so flow_seq gradient
+    # reaches both the V1 (ffv1) and second-order (ffv2) pathways.
+    model.forward = types.MethodType(forward_for_attack, model)
     return model
 
 
@@ -358,6 +413,9 @@ def pgd_attack(model, frames, mask_t, eps, steps, alpha, iters,
                 flow_1_mag = (last_flow_1 * mask_t).pow(2).mean().sqrt().item()
             print(f"  step {step:3d}  loss={last_loss:.4f}  "
                   f"masked_rms[flow]={flow_mag:.3f}  masked_rms[flow_1]={flow_1_mag:.3f}")
+        # if last_loss < 1e-4:
+        #    print(f"  [early stop] loss={last_loss:.2e} < 1e-4 at step {step}")
+        #    break
 
     delta_lr = delta_lr.detach()
     delta_final = make_perturbation(delta_lr)

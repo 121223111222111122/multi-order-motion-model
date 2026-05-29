@@ -465,12 +465,12 @@ def main():
     ap.add_argument("--eps", type=float, default=13.0, help="L_inf budget in 0-255 pixel space (13 = ~5%)")
     ap.add_argument("--steps", type=int, default=50)
     ap.add_argument("--alpha", type=float, default=None, help="PGD step size (default eps/10)")
-    ap.add_argument("--iters", type=int, default=8, help="model recurrent iterations; lower to save memory")
+    ap.add_argument("--iters", type=int, default=6, help="model recurrent iterations; lower to save memory")
     ap.add_argument("--mask-tau", type=float, default=0.15, help="MaskCut threshold")
     ap.add_argument("--no-crf", action="store_true", help="skip DenseCRF refinement of the mask")
     ap.add_argument("--smooth-factor", type=int, default=4,
                     help="parameterize delta at H/k x W/k, upsample to (H,W); k=4-8 forces a human-visible spatial scale")
-    ap.add_argument("--max-side", type=int, default=None,
+    ap.add_argument("--max-side", type=int, default=480.0,
                     help="downscale input so longer side is <= this (helps with GPU memory)")
     ap.add_argument("--n-eot", type=int, default=3,
                     help="EOT samples per PGD step (>=2 averages gradients over random augmentations; 1 disables EOT)")
